@@ -122,3 +122,10 @@ cd "$DSH_HOME/profiles/web" && pnpm remove @clarkchan/trajectory-reader
 ```
 
 `dsh plugin` automatically removes the package from `dsh.profile.bundles` on uninstall — no manual cleanup needed.
+
+## Fork additions (0.4.0): settings panel & in-flight progress summaries
+
+- **⚙ Settings** (top-right of the 轨迹解读 page): model source (follow conversation / local Ollama with a model list / explicit provider+model), auto-summary toggle, and the three trigger thresholds plus their cooldown. Saved to `~/.dsh/plugin-data/trajectory-reader/settings.json` — nothing in DSH itself is touched.
+- **⏱ Auto progress digest**: while the page is open, the current turn is evaluated every 5 s. If any condition holds — no user-facing text for N minutes (default 5), more than N consecutive tool calls (default 10), or a single tool call running longer than N minutes (default 3), each with its own cooldown (default 5) — one model call is made and the digest (`### 当前在做什么 / ### 进度 / ### 关键决策 / ### 需要注意`) is appended to the "进行中 · 自动进度解读" block at the top of the page.
+- Limitation: digests are produced only while the 轨迹解读 page is open (no node stream when the tab is hidden).
+- Routes: `GET/POST /plugin-api/trajectory-reader/settings`, `GET /plugin-api/trajectory-reader/models`, `POST /plugin-api/trajectory-reader/summarize` with `mode: "progress"`.

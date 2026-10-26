@@ -33,6 +33,84 @@ window.__ModuleLoader__.load({
      * TRAJECTORY_READER_OLLAMA_URL 覆盖，默认 http://127.0.0.1:11434。
      */
     var LOCAL_ROUTE = { provider: "ollama-local", model: "qwen35-4b-fast:latest" };
+
+    /** 服务端路由：AI 解读 / 设置读写 / 本地模型列表。 */
+    var SETTINGS_URL = "/plugin-api/trajectory-reader/settings";
+    var MODELS_URL = "/plugin-api/trajectory-reader/models";
+
+    /**
+     * 默认设置（设置页可改，持久化在服务端 ~/.dsh/plugin-data/trajectory-reader/settings.json）。
+     *
+     *   autoSummarize —— 长任务进行中自动触发进度解读
+     *   model.mode    —— "session" 跟随对话模型 / "local" 本机 Ollama / "fixed" 指定 provider+model
+     *   triggers      —— 三个自动触发阈值与统一冷却时间（分钟 / 次）
+     */
+    var DEFAULT_SETTINGS = {
+      autoSummarize: true,
+      model: {
+        mode: LOCAL_ROUTE ? "local" : "session",
+        provider: LOCAL_ROUTE ? LOCAL_ROUTE.provider : "",
+        model: LOCAL_ROUTE ? LOCAL_ROUTE.model : ""
+      },
+      triggers: { idleTextMinutes: 5, toolBurstCount: 10, slowToolMinutes: 3, cooldownMinutes: 5 }
+    };
+
+    function numOr(v, fallback) {
+      var n = typeof v === "number" ? v : Number(v);
+      return isFinite(n) && n > 0 ? n : fallback;
+    }
+
+    /** 把服务端/用户给的部分设置合并到默认值上（缺字段一律回退默认）。 */
+    function mergeSettings(raw) {
+      var base = {
+        autoSummarize: DEFAULT_SETTINGS.autoSummarize,
+        model: Object.assign({}, DEFAULT_SETTINGS.model),
+        triggers: Object.assign({}, DEFAULT_SETTINGS.triggers)
+      };
+      if (!raw || typeof raw !== "object") return base;
+      if (typeof raw.autoSummarize === "boolean") base.autoSummarize = raw.autoSummarize;
+      if (raw.model && typeof raw.model === "object") {
+        var m = raw.model;
+        if (m.mode === "session" || m.mode === "local" || m.mode === "fixed") base.model.mode = m.mode;
+        if (typeof m.provider === "string") base.model.provider = m.provider;
+        if (typeof m.model === "string") base.model.model = m.model;
+      }
+      if (raw.triggers && typeof raw.triggers === "object") {
+        var t = raw.triggers;
+        base.triggers.idleTextMinutes = numOr(t.idleTextMinutes, base.triggers.idleTextMinutes);
+        base.triggers.toolBurstCount = numOr(t.toolBurstCount, base.triggers.toolBurstCount);
+        base.triggers.slowToolMinutes = numOr(t.slowToolMinutes, base.triggers.slowToolMinutes);
+        base.triggers.cooldownMinutes = numOr(t.cooldownMinutes, base.triggers.cooldownMinutes);
+      }
+      return base;
+    }
+
+    function loadSettings() {
+      return fetch(SETTINGS_URL, { method: "GET" })
+        .then(function (res) { return res.ok ? res.json() : null; })
+        .then(function (data) { return mergeSettings(data && data.settings); })
+        .catch(function () { return mergeSettings(null); });
+    }
+
+    function saveSettings(next) {
+      return fetch(SETTINGS_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ settings: next })
+      })
+        .then(function (res) { if (!res.ok) throw new Error("HTTP " + res.status); return res.json(); })
+        .then(function (data) {
+          if (!data || !data.ok) throw new Error((data && data.error) || "保存失败");
+          return mergeSettings(data.settings);
+        });
+    }
+
+    function loadModels() {
+      return fetch(MODELS_URL, { method: "GET" })
+        .then(function (res) { return res.json(); })
+        .catch(function (err) { return { ok: false, error: String(err && err.message || err) }; });
+    }
+
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
     var React = require("react");
@@ -109,7 +187,37 @@ window.__ModuleLoader__.load({
       ".tr-btn-head{margin-left:auto}",
       ".tr-ai-hint{font-size:11.5px;color:var(--dsw-alias-label-caption,#6b7280)}",
 
-      ".tr-foot{color:var(--dsw-alias-label-caption,#6b7280);font-size:11.5px;margin-top:18px;text-align:center}"
+      ".tr-foot{color:var(--dsw-alias-label-caption,#6b7280);font-size:11.5px;margin-top:18px;text-align:center}",
+
+      // ⏱ 进行中 · 自动进度解读
+      ".tr-progress{border:1px solid rgba(86,200,168,.35);background:rgba(86,200,168,.06);border-radius:12px;margin:12px 0;overflow:hidden}",
+      ".tr-progress-head{display:flex;align-items:center;gap:8px;padding:8px 14px;font-size:12px;font-weight:650;color:#56c8a8;border-bottom:1px solid rgba(86,200,168,.22)}",
+      ".tr-progress-hint{font-weight:400;color:var(--dsw-alias-label-tertiary,#8a93a6);font-size:11.5px}",
+      ".tr-progress-item{padding:9px 14px 10px;border-bottom:1px dashed rgba(86,200,168,.18)}",
+      ".tr-progress-item:last-child{border-bottom:0}",
+      ".tr-progress-meta{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--dsw-alias-label-tertiary,#8a93a6);margin-bottom:4px;flex-wrap:wrap}",
+      ".tr-progress-tag{border:1px solid rgba(86,200,168,.4);background:rgba(86,200,168,.12);color:#56c8a8;border-radius:999px;padding:0 8px;font-size:11px;font-weight:650}",
+      ".tr-progress-text{font-size:12.5px;line-height:1.72;color:var(--dsw-alias-label-primary,#e8e8f0);white-space:pre-wrap;word-break:break-word}",
+      ".tr-progress-pending{color:var(--dsw-alias-label-tertiary,#8a93a6);font-size:12px}",
+      ".tr-progress-err{color:var(--dsw-alias-state-error-primary,#ff5a6e);font-size:12px;white-space:pre-wrap}",
+
+      // ⚙ 设置面板
+      ".tr-mask{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:20}",
+      ".tr-panel{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:21;width:min(560px,92vw);max-height:86vh;overflow:auto;background:var(--dsw-alias-bg-base,#0b0d14);border:1px solid var(--dsw-alias-border-l2,#2a3142);border-radius:14px;padding:16px 18px 14px;box-shadow:0 18px 60px rgba(0,0,0,.5)}",
+      ".tr-panel h3{margin:0 0 10px;font-size:14px;color:var(--dsw-alias-label-primary,#e8e8f0)}",
+      ".tr-field{margin:10px 0}",
+      ".tr-field-label{display:block;font-size:12px;color:var(--dsw-alias-label-secondary,#b6bfd0);margin-bottom:5px;font-weight:650}",
+      ".tr-hint{font-size:11.5px;color:var(--dsw-alias-label-caption,#6b7280);margin-top:4px;line-height:1.6}",
+      ".tr-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
+      ".tr-input,.tr-select{background:var(--dsw-alias-bg-layer-1,#12161f);border:1px solid var(--dsw-alias-border-l2,#2a3142);border-radius:8px;color:var(--dsw-alias-label-primary,#e8e8f0);font-size:12.5px;padding:5px 8px;min-width:0}",
+      ".tr-input[type=number]{width:88px}",
+      ".tr-select{max-width:100%}",
+      ".tr-radio{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;color:var(--dsw-alias-label-primary,#e8e8f0);margin-right:14px}",
+      ".tr-panel-foot{display:flex;align-items:center;gap:8px;justify-content:flex-end;margin-top:14px;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l1,#222838)}",
+      ".tr-btn-primary{border-color:rgba(91,157,255,.5);background:rgba(91,157,255,.18);color:#9dc4ff}",
+      ".tr-btn-primary:hover{background:rgba(91,157,255,.28)}",
+      ".tr-save-err{color:var(--dsw-alias-state-error-primary,#ff5a6e);font-size:12px;margin-right:auto}",
+      ".tr-save-ok{color:#56c8a8;font-size:12px;margin-right:auto}"
     ].join("");
     if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=\"" + CSS_TAG + "\"]") === null) {
       var tag = document.createElement("style");
@@ -603,17 +711,21 @@ window.__ModuleLoader__.load({
         var seq = seqOf(node);
         var turn = turnOf(node);
         if (node.kind === "user" || node.kind === "steering") {
-          out.push({ kind: node.kind, seq: seq, turn: turn, content: d.content });
+          out.push({ kind: node.kind, seq: seq, turn: turn, content: d.content, time: typeof d.time === "number" ? d.time : 0 });
         } else if (node.kind === "assistant-step") {
-          out.push({ kind: "assistant", seq: seq, turn: typeof d.turn === "number" ? d.turn : turn, blocks: d.blocks || [] });
+          out.push({ kind: "assistant", seq: seq, turn: typeof d.turn === "number" ? d.turn : turn, blocks: d.blocks || [], time: typeof d.time === "number" ? d.time : 0 });
         } else if (node.kind === "tool-call") {
           var root = d.root || d;
           var tname = root.name || (root.call && root.call.name) || "";
           var argsRaw = root.argsRaw || (root.call && root.call.argsRaw) || "";
+          var callId = root.callId || node.key || "";
+          var when = typeof root.time === "number" ? root.time : (typeof d.time === "number" ? d.time : 0);
           if (root.kind === "tool-result") {
-            out.push({ kind: "tool-result", seq: seq, turn: turn, isError: root.isError === true, call: { name: tname }, error: root.error });
+            out.push({ kind: "tool-result", seq: seq, turn: turn, callId: callId, name: tname, isError: root.isError === true, call: { name: tname }, error: root.error, time: when });
           } else if (tname) {
-            out.push({ kind: "assistant", seq: seq, turn: turn, blocks: [{ kind: "tool-call", name: tname, argsRaw: argsRaw }] });
+            out.push({ kind: "assistant", seq: seq, turn: turn, blocks: [{ kind: "tool-call", name: tname, argsRaw: argsRaw }], time: when });
+            // 供「进行中进度」使用：未完成的工具调用（有 start 无 result 即进行中）
+            out.push({ kind: "tool-start", seq: seq, turn: turn, callId: callId, name: tname, argsRaw: argsRaw, time: when });
           }
         } else if (node.kind === "turn-error") {
           out.push({ kind: "turn-error", seq: seq, turn: turn, message: d.message || "回合错误" });
@@ -632,6 +744,284 @@ window.__ModuleLoader__.load({
       return out;
     }
     exports.adaptChatNodes = adaptChatNodes; // 供无头测试使用
+
+    // ───────────────────── 进行中进度：状态计算与触发规则 ─────────────────────
+
+    function fmtDuration(ms) {
+      var s = Math.max(0, Math.round(ms / 1000));
+      if (s < 60) return s + " 秒";
+      var m = Math.floor(s / 60);
+      if (m < 60) return m + " 分钟" + (s % 60 ? s % 60 + " 秒" : "");
+      return Math.floor(m / 60) + " 小时" + (m % 60) + " 分钟";
+    }
+
+    /**
+     * 从适配后的节点里算出「当前这一轮」的进行中状态。
+     *
+     * toolStarts 是跨 tick 复用的登记表（调用方用 ref 持有）：工具开始时登记，
+     * 结果回来时结算耗时并删除，因此「登记了但没结果」= 正在跑。
+     */
+    function computeProgress(nodes, toolStarts, now) {
+      var sorted = (nodes || []).slice().sort(function (a, b) { return (a.seq || 0) - (b.seq || 0); });
+      var lastUser = null;
+      for (var i = 0; i < sorted.length; i++) {
+        var n = sorted[i];
+        if (n && (n.kind === "user" || n.kind === "steering")) lastUser = n;
+      }
+      var fromSeq = lastUser ? (lastUser.seq || 0) : 0;
+      var p = {
+        userText: lastUser ? nodeText(lastUser) : "",
+        startedAt: lastUser && lastUser.time ? lastUser.time : 0,
+        lastTextAt: 0,
+        lastReplyText: "",
+        lastActivityAt: 0,
+        actions: [],
+        errors: [],
+        notes: [],
+        pending: [],
+        maxCompletedMs: 0,
+        toolCallsSinceText: 0
+      };
+      var completed = {};
+      for (var j = 0; j < sorted.length; j++) {
+        var m = sorted[j];
+        if (!m || (m.seq || 0) < fromSeq) continue;
+        var t = m.time || 0;
+        if (m.kind === "assistant") {
+          var texts = [];
+          (m.blocks || []).forEach(function (b) {
+            if (!b) return;
+            if (b.kind === "text" && typeof b.text === "string" && b.text.trim()) texts.push(b.text.trim());
+            else if (b.kind === "tool-call" && b.name) p.actions.push({ name: b.name, desc: toolCallText(b.name, b.argsRaw), time: t });
+          });
+          if (texts.length) {
+            var joined = texts.join("\n");
+            if (joined !== p.lastReplyText) p.lastReplyText = joined;
+            if (t > p.lastTextAt) p.lastTextAt = t;
+          }
+        } else if (m.kind === "tool-start") {
+          var id = m.callId || m.name || ("t" + m.seq);
+          if (!toolStarts[id]) toolStarts[id] = { startedAt: t || now, name: m.name || "工具", argsRaw: m.argsRaw || "" };
+          if (t > p.lastActivityAt) p.lastActivityAt = t;
+        } else if (m.kind === "tool-result") {
+          var rid = m.callId || m.name || ("t" + m.seq);
+          completed[rid] = true;
+          if (t > p.lastActivityAt) p.lastActivityAt = t;
+        } else if (m.kind === "turn-error") {
+          p.errors.push(m.message || "回合错误");
+        } else if (m.kind === "turn-max-tokens") {
+          p.notes.push("本轮输出达到长度上限");
+        } else if (m.kind === "compaction") {
+          p.notes.push("此前的历史已压缩");
+        } else if (m.kind === "model-retry") {
+          p.notes.push("模型请求重试");
+        }
+      }
+      Object.keys(completed).forEach(function (id) {
+        var s = toolStarts[id];
+        if (!s) return;
+        var d = now - s.startedAt;
+        if (d > p.maxCompletedMs) p.maxCompletedMs = d;
+        delete toolStarts[id];
+      });
+      p.pending = Object.keys(toolStarts).map(function (id) {
+        return { callId: id, name: toolStarts[id].name, argsRaw: toolStarts[id].argsRaw, startedAt: toolStarts[id].startedAt };
+      });
+      p.toolCallsSinceText = p.actions.filter(function (a) { return !p.lastTextAt || (a.time || 0) > p.lastTextAt; }).length;
+      p.active = p.pending.length > 0 || (now - Math.max(p.lastActivityAt, p.lastTextAt, p.startedAt) < 120000);
+      return p;
+    }
+
+    /**
+     * 三个（互相独立的）自动触发条件，各自按冷却时间限流：
+     *   idleText —— 超过 N 分钟没有面向用户的文字输出（仍在干活）
+     *   toolBurst —— 连续工具调用次数 > N
+     *   slowTool —— 单个工具调用已运行 > N 分钟
+     * 返回按优先级排好的候选；调用方每轮只取第一个执行，避免一次触发多轮解读。
+     */
+    function evaluateTriggers(progress, settings, now, firedAt) {
+      var out = [];
+      if (!progress || !progress.active) return out;
+      var t = (settings && settings.triggers) || {};
+      var coolMs = numOr(t.cooldownMinutes, 5) * 60000;
+      function ready(id) {
+        var last = firedAt && firedAt[id] ? firedAt[id] : 0;
+        return now - last >= coolMs;
+      }
+      var idleMs = numOr(t.idleTextMinutes, 5) * 60000;
+      var lastTextAt = progress.lastTextAt || progress.startedAt || 0;
+      if (lastTextAt && now - lastTextAt >= idleMs && progress.toolCallsSinceText > 0 && ready("idleText")) {
+        out.push({ id: "idleText", reason: "已 " + fmtDuration(now - lastTextAt) + " 没有面向用户的文字输出" });
+      }
+      var burst = numOr(t.toolBurstCount, 10);
+      if (progress.toolCallsSinceText >= burst && ready("toolBurst")) {
+        out.push({ id: "toolBurst", reason: "连续 " + progress.toolCallsSinceText + " 次工具调用没有文字输出" });
+      }
+      var slowMs = numOr(t.slowToolMinutes, 3) * 60000;
+      var slow = progress.pending.filter(function (x) { return now - x.startedAt >= slowMs; })[0];
+      if (slow && ready("slowTool")) {
+        out.push({ id: "slowTool", reason: "工具 " + slow.name + " 已运行 " + fmtDuration(now - slow.startedAt) });
+      }
+      return out;
+    }
+
+    /** 组装「进行中」这一轮的解读材料（与已结束轮次的材料同构，额外标注状态）。 */
+    function buildProgressMaterial(p, now, reason) {
+      return {
+        状态: "进行中（本轮尚未结束，助手还没给出最终答复）",
+        触发原因: reason || "",
+        本轮用户需求: cap(stripNoise(p.userText), 1200) || "（本轮无用户消息）",
+        本轮已进行: fmtDuration(now - (p.startedAt || now)),
+        尚未完成的工具: p.pending.slice(0, 8).map(function (x) {
+          return { 工具: x.name, 说明: truncate(x.argsRaw, 160), 已运行: fmtDuration(now - x.startedAt) };
+        }),
+        已完成工具最长耗时: p.maxCompletedMs ? fmtDuration(p.maxCompletedMs) : "无",
+        最近的工具调用: p.actions.slice(-20).map(function (a) { return { 工具: a.name, 说明: a.desc }; }),
+        最近的文字输出: cap(p.lastReplyText, 800) || "（还没有文字输出）",
+        错误: p.errors.slice(0, 10),
+        备注: p.notes.slice(0, 6)
+      };
+    }
+
+    /** 一行字把当前触发阈值说清楚（页头/进度条提示用）。 */
+    function fmtTriggerHint(s) {
+      var t = (s && s.triggers) || {};
+      return "无文字 " + t.idleTextMinutes + " 分钟 / 连续 " + t.toolBurstCount + " 次工具 / 单个工具 " + t.slowToolMinutes + " 分钟，各冷却 " + t.cooldownMinutes + " 分钟";
+    }
+
+    /** ⚙ 设置面板：模型来源 + 自动解读开关 + 三个触发阈值。 */
+    function SettingsPanel(props) {
+      var initial = props.settings;
+      var draftState = React.useState({
+        autoSummarize: initial.autoSummarize,
+        model: Object.assign({}, initial.model),
+        triggers: Object.assign({}, initial.triggers)
+      });
+      var d = draftState[0];
+      var setD = draftState[1];
+      var statusState = React.useState(null);
+      var status = statusState[0];
+      var setStatus = statusState[1];
+      var mode = d.model.mode;
+      var modelList = props.models && props.models.ok && Array.isArray(props.models.models) ? props.models.models : [];
+
+      function radio(value, label) {
+        return jsx.jsx("label", { className: "tr-radio", children: [
+          jsx.jsx("input", {
+            type: "radio",
+            name: "tr-model-mode",
+            checked: mode === value,
+            onChange: function () { setD(function (p) { return Object.assign({}, p, { model: Object.assign({}, p.model, { mode: value }) }); }); }
+          }),
+          label
+        ] }, "mode-" + value);
+      }
+      function numInput(value, onNum) {
+        return jsx.jsx("input", {
+          type: "number",
+          min: 1,
+          step: 1,
+          className: "tr-input",
+          value: value,
+          onChange: function (e) { onNum(numOr(e.target.value, value)); }
+        });
+      }
+      function patchTriggers(part) {
+        setD(function (p) { return Object.assign({}, p, { triggers: Object.assign({}, p.triggers, part) }); });
+      }
+
+      function save() {
+        setStatus({ ok: null, msg: "保存中…" });
+        saveSettings(d)
+          .then(function (saved) { setStatus({ ok: true, msg: "已保存" }); props.onSaved(saved); })
+          .catch(function (err) { setStatus({ ok: false, msg: "保存失败：" + ((err && err.message) || String(err)) }); });
+      }
+
+      return jsx.jsx("div", { className: "tr-panel", children: [
+        jsx.jsx("h3", { children: "轨迹解读 · 设置" }),
+
+        jsx.jsx("div", { className: "tr-field", children: [
+          jsx.jsx("span", { className: "tr-field-label", children: "AI 解读使用哪个模型" }),
+          jsx.jsx("div", { className: "tr-row", children: [
+            radio("session", "跟随对话模型"),
+            radio("local", "本机 Ollama"),
+            radio("fixed", "指定模型")
+          ] })
+        ] }),
+
+        mode === "local" && jsx.jsx("div", { className: "tr-field", children: [
+          jsx.jsx("span", { className: "tr-field-label", children: "本地模型（Ollama）" }),
+          jsx.jsx("div", { className: "tr-row", children: [
+            modelList.length > 0
+              ? jsx.jsx("select", {
+                  className: "tr-select",
+                  value: d.model.model,
+                  onChange: function (e) { setD(function (p) { return Object.assign({}, p, { model: Object.assign({}, p.model, { model: e.target.value }) }); }); },
+                  children: modelList.map(function (m) {
+                    var name = typeof m === "string" ? m : (m && (m.name || m.model)) || "";
+                    return jsx.jsx("option", { value: name, children: name }, name);
+                  })
+                })
+              : jsx.jsx("input", {
+                  className: "tr-input",
+                  value: d.model.model,
+                  placeholder: "例如 qwen35-4b-fast:latest",
+                  onChange: function (e) { setD(function (p) { return Object.assign({}, p, { model: Object.assign({}, p.model, { model: e.target.value }) }); }); }
+                }),
+            jsx.jsx("button", { className: "tr-btn", onClick: props.onReloadModels, children: "刷新列表" })
+          ] }),
+          jsx.jsx("div", { className: "tr-hint", children: props.models && props.models.ok === false
+            ? "读取 Ollama 模型列表失败：" + (props.models.error || "未知错误") + "（确认本机 Ollama 在 127.0.0.1:11434 运行）"
+            : "本地模型不产生云端费用；带思考链的模型会走 Ollama 原生接口并关闭 thinking，避免正文为空。" })
+        ] }),
+
+        mode === "fixed" && jsx.jsx("div", { className: "tr-field", children: [
+          jsx.jsx("span", { className: "tr-field-label", children: "指定 provider / model" }),
+          jsx.jsx("div", { className: "tr-row", children: [
+            jsx.jsx("input", {
+              className: "tr-input",
+              value: d.model.provider,
+              placeholder: "provider，例如 deepseek-account",
+              onChange: function (e) { setD(function (p) { return Object.assign({}, p, { model: Object.assign({}, p.model, { provider: e.target.value }) }); }); }
+            }),
+            jsx.jsx("input", {
+              className: "tr-input",
+              value: d.model.model,
+              placeholder: "model，例如 deepseek-flash",
+              onChange: function (e) { setD(function (p) { return Object.assign({}, p, { model: Object.assign({}, p.model, { model: e.target.value }) }); }); }
+            })
+          ] }),
+          jsx.jsx("div", { className: "tr-hint", children: "provider/model 需与 DSH 里已配置的模型一致（设置 → 模型）。" })
+        ] }),
+
+        jsx.jsx("div", { className: "tr-field", children: [
+          jsx.jsx("span", { className: "tr-field-label", children: "长任务中的自动进度解读" }),
+          jsx.jsx("label", { className: "tr-radio", children: [
+            jsx.jsx("input", {
+              type: "checkbox",
+              checked: d.autoSummarize,
+              onChange: function (e) { setD(function (p) { return Object.assign({}, p, { autoSummarize: e.target.checked }); }); }
+            }),
+            "开启（此页面打开时，进行中的任务满足任一条件就自动解读一次）"
+          ] })
+        ] }),
+
+        jsx.jsx("div", { className: "tr-field", children: [
+          jsx.jsx("span", { className: "tr-field-label", children: "触发条件与阈值" }),
+          jsx.jsx("div", { className: "tr-row", children: ["超过", numInput(d.triggers.idleTextMinutes, function (v) { patchTriggers({ idleTextMinutes: v }); }), "分钟没有面向用户的文字输出"] }),
+          jsx.jsx("div", { className: "tr-row", style: { marginTop: 6 }, children: ["连续工具调用超过", numInput(d.triggers.toolBurstCount, function (v) { patchTriggers({ toolBurstCount: v }); }), "次"] }),
+          jsx.jsx("div", { className: "tr-row", style: { marginTop: 6 }, children: ["单个工具调用超过", numInput(d.triggers.slowToolMinutes, function (v) { patchTriggers({ slowToolMinutes: v }); }), "分钟"] }),
+          jsx.jsx("div", { className: "tr-row", style: { marginTop: 6 }, children: ["每个条件各自冷却", numInput(d.triggers.cooldownMinutes, function (v) { patchTriggers({ cooldownMinutes: v }); }), "分钟"] }),
+          jsx.jsx("div", { className: "tr-hint", children: "三个条件互相独立（任一满足即触发一次），同一条件在冷却时间内不会重复触发。" })
+        ] }),
+
+        jsx.jsx("div", { className: "tr-panel-foot", children: [
+          status && jsx.jsx("span", { className: status.ok === false ? "tr-save-err" : "tr-save-ok", children: status.msg }),
+          jsx.jsx("button", { className: "tr-btn", onClick: props.onClose, children: "取消" }),
+          jsx.jsx("button", { className: "tr-btn tr-btn-primary", onClick: save, children: "保存" })
+        ] })
+      ] });
+    }
 
     function TrajectoryReaderView(props) {
       // 节点来源：Chat 视图快照；拿不到时退回 useChat 的同一份快照。
@@ -655,6 +1045,142 @@ window.__ModuleLoader__.load({
       var interp = React.useMemo(function () { return interpret(nodes); }, [nodes]);
       var stats = interp.stats;
       var rounds = interp.rounds;
+
+      // ── 设置（模型配置 + 触发阈值，服务端持久化）──
+      var settingsState = React.useState(mergeSettings(null));
+      var settings = settingsState[0];
+      var setSettings = settingsState[1];
+      var panelState = React.useState(false);
+      var panelOpen = panelState[0];
+      var setPanelOpen = panelState[1];
+      var modelsState = React.useState(null);
+      var models = modelsState[0];
+      var setModels = modelsState[1];
+
+      React.useEffect(function () {
+        var alive = true;
+        loadSettings().then(function (s) { if (alive) setSettings(s); });
+        return function () { alive = false; };
+      }, []);
+
+      React.useEffect(function () {
+        if (!panelOpen || models) return;
+        var alive = true;
+        loadModels().then(function (res) { if (alive) setModels(res); });
+        return function () { alive = false; };
+      }, [panelOpen, models]);
+
+      // ── 进行中进度：每 5 秒重算一次状态，满足阈值时自动追加一条解读 ──
+      var tickState = React.useState(0);
+      var setTick = tickState[1];
+      var logState = React.useState([]);
+      var progressLog = logState[0];
+      var setProgressLog = logState[1];
+      var toolStarts = React.useRef({});
+      var firedAt = React.useRef({});
+      var busyRef = React.useRef(false);
+      var logRef = React.useRef(progressLog);
+      logRef.current = progressLog;
+
+      React.useEffect(function () {
+        if (!settings.autoSummarize) return;
+        var t = setInterval(function () { setTick(function (n) { return n + 1; }); }, 5000);
+        return function () { clearInterval(t); };
+      }, [settings.autoSummarize]);
+
+      var progress = React.useMemo(function () {
+        return computeProgress(nodes, toolStarts.current, Date.now());
+      }, [nodes, tickState[0]]);
+
+      /** 按设置解析本次解读用哪个模型；null = 交给服务端默认。 */
+      async function pickRoute() {
+        var m = settings.model || {};
+        if (m.mode === "session") {
+          try {
+            if (props.fetchSelectedModel) return await props.fetchSelectedModel();
+            if (props.getSelectedModel) return props.getSelectedModel();
+          } catch (e) { /* 回退服务端默认 */ }
+          return null;
+        }
+        if (m.mode === "local") {
+          return { provider: m.provider || "ollama-local", model: m.model || (LOCAL_ROUTE && LOCAL_ROUTE.model) || "" };
+        }
+        if (m.provider && m.model) return { provider: m.provider, model: m.model };
+        return null;
+      }
+
+      function postSummarize(payload) {
+        return fetch(SUMMARIZE_URL, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload)
+        })
+          .then(function (res) {
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            return res.json();
+          })
+          .then(function (data) {
+            if (!data || !data.ok) throw new Error((data && data.error) || "服务返回异常");
+            return data;
+          });
+      }
+
+      /** 触发一次「进行中」解读：先插入 pending 条目，再回填正文或错误。 */
+      function runProgress(p, now, fire) {
+        var entry = { at: now, reason: fire.reason, status: "pending" };
+        var idx = logRef.current.length;
+        setProgressLog(function (prev) { return prev.concat([entry]); });
+        function settle(patch) {
+          setProgressLog(function (prev) {
+            var next = prev.slice();
+            next[idx] = Object.assign({}, next[idx] || entry, patch);
+            return next;
+          });
+        }
+        return pickRoute()
+          .then(function (sel) {
+            var payload = {
+              mode: "progress",
+              rounds: [{ key: "progress-" + now, material: buildProgressMaterial(p, now, fire.reason) }]
+            };
+            if (sel && typeof sel.provider === "string" && typeof sel.model === "string") {
+              payload.provider = sel.provider;
+              payload.model = sel.model;
+              if (typeof sel.reasoningEffort === "string" && sel.reasoningEffort) payload.reasoningEffort = sel.reasoningEffort;
+            }
+            if (props.sessionId) payload.sessionId = props.sessionId;
+            return postSummarize(payload);
+          })
+          .then(function (data) {
+            var res = (data.results || [])[0] || {};
+            if (res.ok) {
+              var route = data.route || {};
+              settle({
+                status: "done",
+                text: res.text,
+                route: (route.provider || "?") + "/" + (route.model || "?"),
+                routeSource: route.source || "?"
+              });
+            } else {
+              settle({ status: "error", error: res.error || "未知错误" });
+            }
+          })
+          .catch(function (err) {
+            settle({ status: "error", error: (err && err.message) || String(err) });
+          });
+      }
+
+      React.useEffect(function () {
+        if (!settings.autoSummarize || available === false) return;
+        if (busyRef.current) return;
+        var now = Date.now();
+        var fires = evaluateTriggers(progress, settings, now, firedAt.current);
+        if (fires.length === 0) return;
+        var fire = fires[0];
+        firedAt.current[fire.id] = now;
+        busyRef.current = true;
+        runProgress(progress, now, fire).then(function () { busyRef.current = false; }, function () { busyRef.current = false; });
+      }, [progress, settings, available]);
 
       // AI summary state: cache-key → { status, text?, error?, route? }.
       var aiState = React.useState({});
@@ -711,16 +1237,10 @@ window.__ModuleLoader__.load({
             var payload = { rounds: pending.slice(0, 12).map(function (p) {
               return { key: p.key, material: buildRoundMaterial(p.round) };
             }) };
-            // 模型来源：LOCAL_ROUTE 非空 → 固定该模型；为空 → 跟随对话界面当前选择的模型
-            var sel = LOCAL_ROUTE ? Object.assign({}, LOCAL_ROUTE) : null;
+            // 模型来源由设置决定：跟随对话模型 / 本机 Ollama / 指定 provider+model
+            var sel = await pickRoute();
             if (!sel) {
-              if (props.fetchSelectedModel) {
-                sel = await props.fetchSelectedModel();
-              } else if (props.getSelectedModel) {
-                sel = props.getSelectedModel();
-              } else {
-                console.error("[trajectory-reader] 槽位 inject 未生效：props 中缺少 fetchSelectedModel/getSelectedModel（session=" + String(props.sessionId || "?") + "）");
-              }
+              console.warn("[trajectory-reader] 未指定固定模型，按服务端默认模型解读（session=" + String(props.sessionId || "?") + "）");
             }
             if (sel && typeof sel.provider === "string" && typeof sel.model === "string") {
               payload.provider = sel.provider;
@@ -778,15 +1298,41 @@ window.__ModuleLoader__.load({
       return jsx.jsx("div", { className: "tr-root", children: [
         jsx.jsx("div", { className: "tr-head", children: [
           jsx.jsx("span", { className: "tr-title", children: "轨迹解读" }),
-          jsx.jsx("span", { className: "tr-note", children: "按用户轮次逐轮总结：突出「用户需求」与「助手完成方式」" }),
+          jsx.jsx("span", { className: "tr-btn", style: { cursor: "pointer" }, onClick: function () { setPanelOpen(true); }, children: "⚙ 设置" }),
+          jsx.jsx("span", { className: "tr-ai-hint", children: settings.autoSummarize ? ("自动进度解读：开（" + fmtTriggerHint(settings) + "）") : "自动进度解读：关" }),
           available && rounds.length > 0 && jsx.jsx("button", { className: "tr-btn", onClick: summarizeAll, children: "✨ AI 解读全部轮次" }),
           available === false && jsx.jsx("span", { className: "tr-ai-hint", children: "AI 解读未就绪（重启 GUI 后可用）" })
         ] }),
+        jsx.jsx("div", { className: "tr-note", children: "按用户轮次逐轮总结：突出「用户需求」与「助手完成方式」" }),
         jsx.jsx("div", { className: "tr-stats", children: [
           jsx.jsx(StatChip, { label: "需求轮次", value: stats.rounds }),
           jsx.jsx(StatChip, { label: "工具调用", value: stats.toolCalls }),
           jsx.jsx(StatChip, { label: "涉及文件", value: stats.files.length }),
           jsx.jsx(StatChip, { label: "错误", value: stats.errors })
+        ] }),
+
+        (settings.autoSummarize || progressLog.length > 0) && jsx.jsx("div", { className: "tr-progress", children: [
+          jsx.jsx("div", { className: "tr-progress-head", children: [
+            "⏱ 进行中 · 自动进度解读",
+            jsx.jsx("span", { className: "tr-progress-hint", children: settings.autoSummarize ? ("阈值：" + fmtTriggerHint(settings)) : "已关闭（⚙ 设置里可开启）" })
+          ] }),
+          progressLog.length === 0 && jsx.jsx("div", { className: "tr-progress-item", children:
+            jsx.jsx("div", { className: "tr-progress-text", children: settings.autoSummarize
+              ? "任务进行中一旦满足触发条件，这里会自动追加一条进度解读（不需要手动点按钮）。"
+              : "开启自动解读后，长任务进行中会自动追加进度解读。" })
+          }),
+          progressLog.map(function (e, i) {
+            return jsx.jsx("div", { className: "tr-progress-item", children: [
+              jsx.jsx("div", { className: "tr-progress-meta", children: [
+                new Date(e.at).toLocaleTimeString("zh-CN", { hour12: false }),
+                e.route ? " · " + e.route + (e.routeSource ? "（" + (ROUTE_SOURCE_LABEL[e.routeSource] || e.routeSource) + "）" : "") : "",
+                jsx.jsx("span", { className: "tr-progress-tag", children: e.reason })
+              ] }),
+              e.status === "pending" && jsx.jsx("div", { className: "tr-progress-pending", children: "正在生成进度解读…" }),
+              e.status === "error" && jsx.jsx("div", { className: "tr-progress-err", children: "生成失败：" + (e.error || "未知错误") }),
+              e.status === "done" && jsx.jsx("div", { className: "tr-progress-text", children: jsx.jsx(AiText, { text: e.text }) })
+            ] }, "prog-" + i);
+          })
         ] }),
 
         stats.rounds === 0
@@ -799,7 +1345,16 @@ window.__ModuleLoader__.load({
                 onSummarize: function () { summarizeOne(i); }
               }, "round-" + r.index);
             }),
-        jsx.jsx("div", { className: "tr-foot", children: "轨迹解读 · 规则总结即时生成；✨ AI 过程解读由 LLM 按轮生成，展示助手的思考与执行全过程" })
+        jsx.jsx("div", { className: "tr-foot", children: "轨迹解读 · 规则总结即时生成；✨ AI 过程解读由 LLM 按轮生成，展示助手的思考与执行全过程" }),
+
+        panelOpen && jsx.jsx("div", { className: "tr-mask", onClick: function () { setPanelOpen(false); } }),
+        panelOpen && jsx.jsx(SettingsPanel, {
+          settings: settings,
+          models: models,
+          onReloadModels: function () { setModels(null); },
+          onClose: function () { setPanelOpen(false); },
+          onSaved: function (saved) { setSettings(saved); setPanelOpen(false); }
+        })
       ] });
     }
 
@@ -865,6 +1420,11 @@ window.__ModuleLoader__.load({
     exports.apply = apply;
     exports.inject = inject;
     exports.interpret = interpret; // 供无头测试使用
+    exports.evaluateTriggers = evaluateTriggers; // 供无头测试使用
+    exports.computeProgress = computeProgress; // 供无头测试使用
+    exports.buildProgressMaterial = buildProgressMaterial; // 供无头测试使用
+    exports.mergeSettings = mergeSettings; // 供无头测试使用
+    exports.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
     exports.buildRoundMaterial = buildRoundMaterial; // 供无头测试使用
     exports.materialKey = materialKey; // 供无头测试使用
     exports.SUMMARIZE_URL = SUMMARIZE_URL;

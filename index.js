@@ -13,8 +13,69 @@
  * imports so it resolves inside any profile that links this package.
  */
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 /** Route path owned by this plugin (named routes win over the SPA fallback). */
 const SUMMARIZE_PATH = "/plugin-api/trajectory-reader/summarize";
+/** 设置读写与本地模型列表。 */
+const SETTINGS_PATH = "/plugin-api/trajectory-reader/settings";
+const MODELS_PATH = "/plugin-api/trajectory-reader/models";
+/** 设置文件：插件自有数据目录（不写 DSH 本体）。 */
+const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), ".dsh");
+const SETTINGS_FILE = path.join(DSH_HOME, "plugin-data", "trajectory-reader", "settings.json");
+
+/** 默认设置（结构需与客户端 DEFAULT_SETTINGS 保持一致）。 */
+const DEFAULT_SETTINGS = {
+  autoSummarize: true,
+  model: { mode: "local", provider: "ollama-local", model: "qwen35-4b-fast:latest" },
+  triggers: { idleTextMinutes: 5, toolBurstCount: 10, slowToolMinutes: 3, cooldownMinutes: 5 },
+};
+
+function numOr(value, fallback) {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** 合并默认值（容忍缺字段/坏值），返回一份可直接下发的完整设置。 */
+function mergeSettings(raw) {
+  const base = {
+    autoSummarize: DEFAULT_SETTINGS.autoSummarize,
+    model: { ...DEFAULT_SETTINGS.model },
+    triggers: { ...DEFAULT_SETTINGS.triggers },
+  };
+  if (!raw || typeof raw !== "object") return base;
+  if (typeof raw.autoSummarize === "boolean") base.autoSummarize = raw.autoSummarize;
+  if (raw.model && typeof raw.model === "object") {
+    const m = raw.model;
+    if (m.mode === "session" || m.mode === "local" || m.mode === "fixed") base.model.mode = m.mode;
+    if (typeof m.provider === "string") base.model.provider = m.provider.slice(0, 120);
+    if (typeof m.model === "string") base.model.model = m.model.slice(0, 120);
+  }
+  if (raw.triggers && typeof raw.triggers === "object") {
+    const t = raw.triggers;
+    base.triggers.idleTextMinutes = Math.min(1440, numOr(t.idleTextMinutes, base.triggers.idleTextMinutes));
+    base.triggers.toolBurstCount = Math.min(1000, numOr(t.toolBurstCount, base.triggers.toolBurstCount));
+    base.triggers.slowToolMinutes = Math.min(1440, numOr(t.slowToolMinutes, base.triggers.slowToolMinutes));
+    base.triggers.cooldownMinutes = Math.min(1440, numOr(t.cooldownMinutes, base.triggers.cooldownMinutes));
+  }
+  return base;
+}
+
+function loadSettings() {
+  try {
+    return mergeSettings(JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8")));
+  } catch {
+    return mergeSettings(null);
+  }
+}
+
+function saveSettings(settings) {
+  fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), "utf8");
+  return settings;
+}
 /** Max rounds accepted per request (each is one model call). */
 const MAX_ROUNDS_PER_REQUEST = 12;
 /** Per-round model-call budget (room for reasoning + the 400-char answer). */
@@ -57,6 +118,46 @@ const SYSTEM_PROMPT = [
   "4. 全文不超过 400 字；文件名、命令、错误信息一律用反引号包裹。",
   "5. 直接输出解读内容，不要输出任何开场白、结束语，也不要整段复述材料原文。"
 ].join("\n");
+
+/**
+ * 进行中进度解读的 system prompt：这一轮还没结束，用户只想知道现在在做什么、
+ * 进度如何、做了哪些关键决策、有什么风险。
+ */
+const PROGRESS_PROMPT = [
+  "你是 DeepSeek Harness（编程助手框架）的「任务进度解读员」。用户正在跑一个长任务，正在做别的事，需要快速知道助手此刻在干什么、进展到哪一步、做了哪些关键决策。",
+  "你会收到「进行中」这一轮的材料：本轮用户需求、已进行时长、尚未完成的工具调用（含已运行时长）、最近按顺序的工具调用、最近的文字输出、错误与备注。注意：这一轮还没有结束，助手还没给出最终答复。",
+  "",
+  "必须遵守：",
+  "1. 只依据材料，禁止编造材料中没有的文件、命令、结论或原因。",
+  "2. 输出使用以下 Markdown 结构（保留标题行，顺序不变）：",
+  "",
+  "### 当前在做什么",
+  "（一两句话说明此刻的动作）",
+  "",
+  "### 进度",
+  "（做到哪一步了：已完成了哪些动作、还卡在哪；用到材料里的次数与时长）",
+  "",
+  "### 关键决策",
+  "（从动作顺序里看出助手选了什么路线、为什么先做这件事；没有明显决策就写「暂无」）",
+  "",
+  "### 需要注意",
+  "（耗时异常、反复重试、报错、疑似卡住等；没有就写「无」）",
+  "",
+  "3. 全文不超过 300 字；文件名、命令、报错用反引号包裹。",
+  "4. 直接输出解读内容，不要开场白与结束语。",
+].join("\n");
+
+/** 按模式选择 system prompt 与用户消息（普通轮次 / 进行中进度）。 */
+function promptFor(mode) {
+  return mode === "progress" ? PROGRESS_PROMPT : SYSTEM_PROMPT;
+}
+
+function userContentFor(material, index, mode) {
+  if (mode === "progress") {
+    return `请解读第 ${index} 轮「进行中」的会话材料（JSON），这一轮还没有结束：\n${JSON.stringify(sanitize(material))}`;
+  }
+  return frameRound(material, index);
+}
 
 /** Assemble visible text from a raw chunk stream (no library imports). */
 function assembleText(chunks) {
@@ -145,7 +246,8 @@ function resolveRoute(ctx, body) {
 }
 
 /** One-line diagnostic log (console + /tmp file); never throws. */
-function logSummarize(sessionId, route, roundCount) {
+function logSummarize(sessionId, route, roundCount, mode) {
+  if (mode === "progress") roundCount = roundCount + " (progress)";
   const line = `${new Date().toISOString()} session=${sessionId} route=${route.provider}/${route.model} source=${route.source} rounds=${roundCount}\n`;
   try {
     console.log(`[trajectory-reader] summarize ${line.trim()}`);
@@ -159,7 +261,7 @@ function logSummarize(sessionId, route, roundCount) {
  * 带思考链的模型（qwen3.5 / qwen35 等）在 OpenAI 兼容的 /v1 上无法关闭 thinking，
  * token 预算会被 reasoning 吃光、正文为空；只有原生接口能稳定拿到正文。
  */
-async function summarizeWithLocalOllama(route, material, index, outerSignal) {
+async function summarizeWithLocalOllama(route, material, index, outerSignal, systemPrompt, mode) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), LOCAL_TIMEOUT_MS);
   const onAbort = () => ac.abort();
@@ -177,8 +279,8 @@ async function summarizeWithLocalOllama(route, material, index, outerSignal) {
         think: false,
         options: { num_predict: LOCAL_NUM_PREDICT, temperature: 0.2 },
         messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: frameRound(material, index) },
+          { role: "system", content: systemPrompt || SYSTEM_PROMPT },
+          { role: "user", content: userContentFor(material, index, mode) },
         ],
       }),
       signal: ac.signal,
@@ -195,18 +297,19 @@ async function summarizeWithLocalOllama(route, material, index, outerSignal) {
 }
 
 /** One round → one model call → { key, ok, text?, error? }. */
-async function summarizeRound(ctx, route, key, material, index, signal, reasoningEffort) {
+async function summarizeRound(ctx, route, key, material, index, signal, reasoningEffort, mode) {
+  const systemPrompt = promptFor(mode);
   try {
     // 本地 Ollama：直接走原生接口，不经过宿主的 llm 服务。
     if (route.provider === LOCAL_PROVIDER) {
-      const text = await summarizeWithLocalOllama(route, material, index, signal);
+      const text = await summarizeWithLocalOllama(route, material, index, signal, systemPrompt, mode);
       return { key, ok: true, text };
     }
     const options = {
       provider: route.provider,
       model: route.model,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: [{ type: "text", text: frameRound(material, index) }] }],
+      system: systemPrompt,
+      messages: [{ role: "user", content: [{ type: "text", text: userContentFor(material, index, mode) }] }],
       maxTokens: MAX_OUTPUT_TOKENS,
       signal
     };
@@ -268,9 +371,10 @@ export function apply(ctx) {
       }
       const rounds = body.rounds.slice(0, MAX_ROUNDS_PER_REQUEST);
       const route = resolveRoute(ctx, body);
+      const mode = body.mode === "progress" ? "progress" : "round";
       const reasoningEffort = typeof body.reasoningEffort === "string" && body.reasoningEffort ? body.reasoningEffort : undefined;
       const sid = typeof body.sessionId === "string" && body.sessionId ? body.sessionId.slice(0, 96) : "?";
-      logSummarize(sid, route, rounds.length);
+      logSummarize(sid, route, rounds.length, mode);
       const results = [];
       for (let i = 0; i < rounds.length; i++) {
         const r = rounds[i];
@@ -279,13 +383,70 @@ export function apply(ctx) {
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(), CALL_TIMEOUT_MS);
         try {
-          results.push(await summarizeRound(ctx, route, key, material, i + 1, ac.signal, reasoningEffort));
+          results.push(await summarizeRound(ctx, route, key, material, i + 1, ac.signal, reasoningEffort, mode));
         } finally {
           clearTimeout(timer);
         }
       }
       sendJson(res, 200, { ok: true, route, results });
     }
+  });
+
+  // ── 设置读写：模型配置 + 自动触发阈值（持久化到插件自有数据目录）──
+  ctx.webServer.register({
+    kind: "exact",
+    path: SETTINGS_PATH,
+    handler: async (req, res) => {
+      if (req.method === "GET" || req.method === "HEAD") {
+        sendJson(res, 200, { ok: true, settings: loadSettings(), file: SETTINGS_FILE });
+        return;
+      }
+      if (req.method !== "POST") { sendJson(res, 405, { ok: false, error: "method not allowed" }); return; }
+      let body;
+      try {
+        body = JSON.parse(await readBody(req, 256 * 1024));
+      } catch {
+        sendJson(res, 400, { ok: false, error: "invalid JSON body" });
+        return;
+      }
+      try {
+        const next = mergeSettings(body && body.settings ? body.settings : body);
+        saveSettings(next);
+        sendJson(res, 200, { ok: true, settings: next });
+      } catch (err) {
+        sendJson(res, 500, { ok: false, error: "保存失败：" + (err && err.message ? err.message : String(err)) });
+      }
+    },
+  });
+
+  // ── 本地模型列表（设置页的下拉框数据源）──
+  ctx.webServer.register({
+    kind: "exact",
+    path: MODELS_PATH,
+    handler: async (req, res) => {
+      if (req.method !== "GET" && req.method !== "HEAD") { sendJson(res, 405, { ok: false, error: "method not allowed" }); return; }
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 5000);
+      try {
+        const upstream = await fetch(LOCAL_BASE_URL + "/api/tags", { signal: ac.signal });
+        if (!upstream.ok) throw new Error("ollama HTTP " + upstream.status);
+        const json = await upstream.json();
+        const models = (json && Array.isArray(json.models) ? json.models : [])
+          .map((m) => ({ name: m && m.name ? String(m.name) : "", size: m && typeof m.size === "number" ? m.size : 0 }))
+          .filter((m) => m.name);
+        sendJson(res, 200, { ok: true, provider: LOCAL_PROVIDER, models, endpoint: LOCAL_BASE_URL });
+      } catch (err) {
+        sendJson(res, 200, {
+          ok: false,
+          provider: LOCAL_PROVIDER,
+          models: [],
+          endpoint: LOCAL_BASE_URL,
+          error: err && err.message ? err.message : String(err),
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    },
   });
 }
 

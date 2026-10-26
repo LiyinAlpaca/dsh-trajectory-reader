@@ -122,3 +122,29 @@ cd "$DSH_HOME/profiles/web" && pnpm remove @clarkchan/trajectory-reader
 ```
 
 卸载后 `dsh plugin` 会自动把该包从 `dsh.profile.bundles` 移除，无需手动清理。
+
+## 本 fork 新增（0.4.0）：设置页与长任务自动进度解读
+
+### ⚙ 设置页
+
+「轨迹解读」页头右上角点 **⚙ 设置** 打开，保存后即刻生效，配置写入 `~/.dsh/plugin-data/trajectory-reader/settings.json`（插件自有数据目录，不涉及 DSH 本体）：
+
+| 项 | 说明 |
+| --- | --- |
+| 模型来源 | 跟随对话模型 / 本机 Ollama（下拉列出本机模型）/ 指定 provider+model |
+| 自动进度解读 | 开关；关掉后只在手动点 ✨ 时才调用模型 |
+| 超过 N 分钟没有面向用户的文字输出 | 默认 5 |
+| 连续工具调用超过 N 次 | 默认 10 |
+| 单个工具调用超过 N 分钟 | 默认 3 |
+| 每个条件各自冷却 N 分钟 | 默认 5 |
+
+### ⏱ 长任务自动进度解读
+
+页面打开时每 5 秒评估一次「当前这一轮」（最后一个用户消息之后的节点）的进行中状态，满足任一条件就自动调用一次模型，结果追加在页面顶部的「进行中 · 自动进度解读」区块，输出 `### 当前在做什么 / ### 进度 / ### 关键决策 / ### 需要注意` 四段。
+
+- 「连续工具调用」= 最后一次文字输出之后的工具调用次数。
+- 「单个工具耗时」= 工具开始调用到现在的时长（拿到结果即结算，不再计入进行中）。
+- 三个条件互相独立，同一条件在冷却时间内不重复触发，一次只触发一条解读。
+- 限制：自动解读只在「轨迹解读」页打开时进行——页面切走或窗口最小化时拿不到节点流。
+
+服务端路由：`GET/POST /plugin-api/trajectory-reader/settings`（读写设置）、`GET /plugin-api/trajectory-reader/models`（列本机 Ollama 模型）、`POST /plugin-api/trajectory-reader/summarize`（`mode: "progress"` 走进度提示词）。
