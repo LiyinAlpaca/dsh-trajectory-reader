@@ -29,6 +29,7 @@ const SETTINGS_FILE = path.join(DSH_HOME, "plugin-data", "trajectory-reader", "s
 /** 默认设置（结构需与客户端 DEFAULT_SETTINGS 保持一致）。 */
 const DEFAULT_SETTINGS = {
   autoSummarize: true,
+  autoExplainActions: true,
   model: { mode: "local", provider: "ollama-local", model: "qwen35-4b-fast:latest" },
   triggers: { idleTextMinutes: 5, toolBurstCount: 10, slowToolMinutes: 3, cooldownMinutes: 5 },
 };
@@ -42,11 +43,13 @@ function numOr(value, fallback) {
 function mergeSettings(raw) {
   const base = {
     autoSummarize: DEFAULT_SETTINGS.autoSummarize,
+    autoExplainActions: DEFAULT_SETTINGS.autoExplainActions,
     model: { ...DEFAULT_SETTINGS.model },
     triggers: { ...DEFAULT_SETTINGS.triggers },
   };
   if (!raw || typeof raw !== "object") return base;
   if (typeof raw.autoSummarize === "boolean") base.autoSummarize = raw.autoSummarize;
+  if (typeof raw.autoExplainActions === "boolean") base.autoExplainActions = raw.autoExplainActions;
   if (raw.model && typeof raw.model === "object") {
     const m = raw.model;
     if (m.mode === "session" || m.mode === "local" || m.mode === "fixed") base.model.mode = m.mode;
@@ -115,8 +118,9 @@ const SYSTEM_PROMPT = [
   "（这一轮最终完成什么、主要改动落在哪里、还有什么未完成或失败的）",
   "",
   "3. 重点讲清「过程」与动作之间的因果关系（例如：先读 `A` 是为了确认 `B`，随后修改 `C` 来完成 `D`），不要只罗列工具名。",
-  "4. 全文不超过 400 字；文件名、命令、错误信息一律用反引号包裹。",
-  "5. 直接输出解读内容，不要输出任何开场白、结束语，也不要整段复述材料原文。"
+  "4. 执行过程里每一步都要交代「目的 → 动作 → 结果」，用自然语言说明目的；**不要把原始命令、JSON 参数、冗长路径照抄进解读**，命令只用一句话说清用途（例如「跑了一遍完整测试」），确有必要才在反引号里保留关键命令片段。",
+  "5. 全文不超过 400 字；文件名、命令、错误信息一律用反引号包裹。",
+  "6. 直接输出解读内容，不要输出任何开场白、结束语，也不要整段复述材料原文。"
 ].join("\n");
 
 /**
@@ -143,18 +147,40 @@ const PROGRESS_PROMPT = [
   "### 需要注意",
   "（耗时异常、反复重试、报错、疑似卡住等；没有就写「无」）",
   "",
-  "3. 全文不超过 300 字；文件名、命令、报错用反引号包裹。",
+  "3. 全文不超过 300 字；文件名、命令、报错用反引号包裹；用自然语言说明目的，不要照抄原始命令或 JSON 参数。",
   "4. 直接输出解读内容，不要开场白与结束语。",
 ].join("\n");
 
-/** 按模式选择 system prompt 与用户消息（普通轮次 / 进行中进度）。 */
+/**
+ * 动作翻译（mode=actions）：把这一轮的工具调用逐条翻成「为了…，调用了…，结果…」，
+ * 不贴原始命令/JSON 参数——用户只需要看懂"这一步在干嘛"。
+ */
+const ACTIONS_PROMPT = [
+  "你是 DeepSeek Harness（编程助手框架）的动作翻译员。用户不熟悉终端命令，看不懂工具调用里的原始参数，需要你把助手执行的每一步翻译成一句大白话。",
+  "你会收到本轮所有工具调用的 JSON 数组（按发生顺序），每项含 tool（工具名）、args（参数摘要）、result（结果摘要）、error（报错摘要，可能为空）。",
+  "",
+  "必须遵守：",
+  "1. 每行一条，严格使用格式：`序号. 为了<目的>，调用了<工具的中文说法>，<结果一句话>`",
+  "2. 目的必须从参数推断出意图（例如 grep 的模式、read 的路径、bash 命令的作用、edit 改的是哪个文件），禁止照抄原始命令、JSON、长路径或参数原文。",
+  "3. 命令只描述用途，例如「为了确认测试是否通过，调用了命令执行工具，结果全部通过」。",
+  "4. 结果写清楚产出：成功说明得到了什么（例如「找到 3 处引用」「写入了 42 行」），失败写明报错要点；没有结果写「暂无结果」。",
+  "5. 条数与输入数组长度一致、顺序一致；每条不超过 50 个字；不要标题、不要解释、不要额外空行。",
+].join("\n");
+
+/** 按模式选择 system prompt 与用户消息（普通轮次 / 进行中进度 / 动作翻译）。 */
 function promptFor(mode) {
-  return mode === "progress" ? PROGRESS_PROMPT : SYSTEM_PROMPT;
+  if (mode === "progress") return PROGRESS_PROMPT;
+  if (mode === "actions") return ACTIONS_PROMPT;
+  return SYSTEM_PROMPT;
 }
 
 function userContentFor(material, index, mode) {
   if (mode === "progress") {
     return `请解读第 ${index} 轮「进行中」的会话材料（JSON），这一轮还没有结束：\n${JSON.stringify(sanitize(material))}`;
+  }
+  if (mode === "actions") {
+    const list = material && Array.isArray(material.actions) ? material.actions : material;
+    return `请把这些工具调用逐条翻译成大白话（JSON 数组，按发生顺序）：\n${JSON.stringify(sanitize(list))}`;
   }
   return frameRound(material, index);
 }
@@ -371,7 +397,7 @@ export function apply(ctx) {
       }
       const rounds = body.rounds.slice(0, MAX_ROUNDS_PER_REQUEST);
       const route = resolveRoute(ctx, body);
-      const mode = body.mode === "progress" ? "progress" : "round";
+      const mode = body.mode === "progress" ? "progress" : body.mode === "actions" ? "actions" : "round";
       const reasoningEffort = typeof body.reasoningEffort === "string" && body.reasoningEffort ? body.reasoningEffort : undefined;
       const sid = typeof body.sessionId === "string" && body.sessionId ? body.sessionId.slice(0, 96) : "?";
       logSummarize(sid, route, rounds.length, mode);

@@ -47,6 +47,7 @@ window.__ModuleLoader__.load({
      */
     var DEFAULT_SETTINGS = {
       autoSummarize: true,
+      autoExplainActions: true,
       model: {
         mode: LOCAL_ROUTE ? "local" : "session",
         provider: LOCAL_ROUTE ? LOCAL_ROUTE.provider : "",
@@ -64,11 +65,13 @@ window.__ModuleLoader__.load({
     function mergeSettings(raw) {
       var base = {
         autoSummarize: DEFAULT_SETTINGS.autoSummarize,
+        autoExplainActions: DEFAULT_SETTINGS.autoExplainActions,
         model: Object.assign({}, DEFAULT_SETTINGS.model),
         triggers: Object.assign({}, DEFAULT_SETTINGS.triggers)
       };
       if (!raw || typeof raw !== "object") return base;
       if (typeof raw.autoSummarize === "boolean") base.autoSummarize = raw.autoSummarize;
+      if (typeof raw.autoExplainActions === "boolean") base.autoExplainActions = raw.autoExplainActions;
       if (raw.model && typeof raw.model === "object") {
         var m = raw.model;
         if (m.mode === "session" || m.mode === "local" || m.mode === "fixed") base.model.mode = m.mode;
@@ -148,6 +151,13 @@ window.__ModuleLoader__.load({
       ".tr-bullet{margin:4px 0;font-size:12.5px;line-height:1.7;color:var(--dsw-alias-label-secondary,#b6bfd0)}",
       ".tr-bullet .tr-k{color:var(--dsw-alias-label-tertiary,#8a93a6)}",
       ".tr-none{color:var(--dsw-alias-label-tertiary,#8a93a6);font-size:12.5px}",
+      ".tr-act{margin:2px 0 4px;display:flex;flex-direction:column;gap:3px}",
+      ".tr-act-line{font-size:12.5px;line-height:1.7;color:var(--dsw-alias-label-primary,#e8e8f0);display:flex;gap:6px}",
+      ".tr-act-no{flex:none;color:#a89bff;font-weight:700}",
+      ".tr-act-src{margin-top:2px;font-size:11px;color:var(--dsw-alias-label-caption,#6b7280)}",
+      ".tr-act-loading{font-size:12px;color:var(--dsw-alias-label-tertiary,#8a93a6)}",
+      ".tr-act-err{font-size:12px;color:var(--dsw-alias-state-error-primary,#ff5a6e)}",
+      ".tr-act-manual{margin:4px 0 2px}",
 
       // ⚠ 错误 / 备注
       ".tr-errors{margin:8px 14px;padding:8px 12px;border-left:3px solid var(--dsw-alias-state-error-primary,#ff5a6e);background:var(--dsw-alias-state-error-tertiary,rgba(255,90,110,.08));border-radius:8px;color:var(--dsw-alias-state-error-primary,#ff5a6e);font-size:12.5px;white-space:pre-wrap}",
@@ -312,11 +322,11 @@ window.__ModuleLoader__.load({
     var CAT_TOOLS = {
       todo_write: "plan", todo: "plan", task: "plan", task_list: "plan", create_goal: "plan", update_goal: "plan", get_goal: "plan",
       read: "recon", glob: "recon", grep: "recon", search_content: "recon", find: "recon", read_image: "recon",
-      web_search: "recon", search: "recon",
-      write: "build", create_file: "build", overwrite_file: "build", edit: "build", append_file: "build", patch: "build",
+      ops_read_files: "recon", web_fetch: "recon", web_search: "recon", search: "recon",
+      write: "build", create_file: "build", overwrite_file: "build", edit: "build", append_file: "build", patch: "build", apply_patch: "build",
       subagent: "delegate", subagent_fork: "delegate", workflow: "delegate", ralph: "delegate", send_message: "delegate", interrupt_agent: "delegate"
     };
-    var BASH_NAMES = { bash: 1, terminal: 1, shell: 1, "terminal-bash": 1, pwsh: 1 };
+    var BASH_NAMES = { bash: 1, ops_bash: 1, terminal: 1, shell: 1, "terminal-bash": 1, pwsh: 1 };
     var VERIFY_RE = /(^|[^a-z0-9])(test|tests|check|smoke|lint|vitest|jest|pytest|spec|tsc|verify)([^a-z0-9]|$)/i;
     var LOOK_RE = /(^|[^a-z0-9-])(ls|cat|head|tail|pwd|which|find|grep|rg|stat|file|du|df)([^a-z0-9]|$)|git (status|log|diff|show|branch)/i;
 
@@ -338,10 +348,12 @@ window.__ModuleLoader__.load({
       var path = args.path || args.file || args.filename || args.pattern || args.pathname;
       if (name === "write" || name === "create_file") return "写入文件 " + (path || "?");
       if (name === "edit" || name === "overwrite_file" || name === "append_file" || name === "patch") return "修改文件 " + (path || "?");
-      if (name === "read") return "读取文件 " + (path || "?");
+      if (name === "read" || name === "ops_read_files") return "读取文件 " + (path || "?");
       if (name === "glob") return "查找文件 " + truncate(path || "", 40);
       if (name === "grep" || name === "search_content") return "搜索内容 " + truncate(args.pattern || args.query || "", 40);
-      if (BASH_NAMES[name]) return "运行命令 " + truncate(args.command || args.cmd || args.script || "", 60);
+      if (BASH_NAMES[name]) return "运行命令 " + truncate(args.command || args.cmd || args.script || "", 50);
+      if (name === "web_fetch") return "抓取网页 " + truncate(args.url || "", 40);
+      if (name === "ops_discover_tools") return "查找可用工具 " + truncate(args.query || "", 30);
       if (name === "web_search" || name === "search") return "网络搜索 " + truncate(args.query || "", 40);
       if (name === "read_image") return "查看图片 " + (path || "?");
       if (name === "todo_write" || name === "todo" || name === "task" || name === "task_list") return "维护任务清单";
@@ -414,7 +426,7 @@ window.__ModuleLoader__.load({
               if (b.kind === "text") texts.push(b.text || "");
               else if (b.kind === "reasoning") reasons.push(b.text || "");
               else if (b.kind === "tool-call") {
-                var act = { name: b.name, desc: toolCallText(b.name, b.argsRaw), cat: categoryFor(b.name, b.argsRaw), argsRaw: b.argsRaw };
+                var act = { name: b.name, desc: toolCallText(b.name, b.argsRaw), cat: categoryFor(b.name, b.argsRaw), argsRaw: b.argsRaw, callId: b.callId || "", result: "" };
                 cur.actions.push(act);
                 stats.toolCalls++;
                 stats.toolTypes[b.name] = (stats.toolTypes[b.name] || 0) + 1;
@@ -429,6 +441,20 @@ window.__ModuleLoader__.load({
           }
           case "tool-result": {
             ensureRound();
+            // 把结果回填到对应动作上（按 callId 匹配；拿不到 callId 就取最近一个还没有结果的）
+            var outText = nodeText(node);
+            var target = null;
+            for (var ai = cur.actions.length - 1; ai >= 0; ai--) {
+              var cand = cur.actions[ai];
+              if (cand.result) continue;
+              if (node.callId && cand.callId && cand.callId !== node.callId) continue;
+              target = cand;
+              break;
+            }
+            if (target) {
+              if (outText) target.result = truncate(outText, 300);
+              if (node.isError) target.isError = true;
+            }
             if (node.isError) {
               stats.errors++;
               cur.errors.push((node.call ? node.call.name : "工具") +
@@ -550,6 +576,32 @@ window.__ModuleLoader__.load({
       return h.toString(36);
     }
 
+    /**
+     * 动作翻译材料：只把「工具 + 参数摘要 + 结果摘要」交给模型，
+     * 由它翻成「为了…，调用了…，结果…」的大白话（mode=actions）。
+     */
+    function buildActionsMaterial(r) {
+      return {
+        actions: r.actions.slice(0, 40).map(function (a, i) {
+          return {
+            i: i + 1,
+            tool: a.name,
+            args: cap(stripNoise(a.desc), 200),
+            result: cap(stripNoise(a.result || ""), 240) || "（无输出或尚未返回）",
+            error: a.isError ? "失败" : ""
+          };
+        })
+      };
+    }
+
+    /** 把模型返回的「1. 为了…」逐行拆成列表。 */
+    function parseActionLines(text) {
+      return String(text || "")
+        .split("\n")
+        .map(function (line) { return line.replace(/^\s*\d+[.、)]\s*/, "").trim(); })
+        .filter(function (line) { return line.length > 0; });
+    }
+
     // ───────────────────────── view components ─────────────────────────
 
     function StatChip(props) {
@@ -583,8 +635,10 @@ window.__ModuleLoader__.load({
     function RoundCard(props) {
       var r = props.round;
       var ai = props.ai; // { status: idle|loading|done|error, text?, error?, route? }
+      var act = props.act; // 动作大白话：{ status: idle|loading|done|error, lines?, error?, route? }
       var available = props.available;
       var busy = ai && ai.status === "loading";
+      var actDone = act && act.status === "done" && act.lines && act.lines.length > 0;
       return jsx.jsx("div", { className: "tr-turn", children: [
         jsx.jsx("div", { className: "tr-turn-head", children: [
           jsx.jsx("span", { className: "tr-turn-num", children: "第 " + r.index + " 轮" }),
@@ -639,7 +693,23 @@ window.__ModuleLoader__.load({
               return jsx.jsx("span", { className: "tr-phase-chip", children: c.label + " " + c.count }, "pc-" + i);
             })
           }),
-          r.categories.map(function (c, i) {
+          // 🧠 动作大白话（AI 把每一步工具调用翻成"为了…，调用了…，结果…"）
+          actDone && jsx.jsx("div", { className: "tr-act", children: act.lines.map(function (line, i) {
+            return jsx.jsx("div", { className: "tr-act-line", children: [
+              jsx.jsx("span", { className: "tr-act-no", children: (i + 1) + "." }),
+              line
+            ] }, "act-" + i);
+          }) }),
+          actDone && jsx.jsx("div", { className: "tr-act-src", children: "🧠 由 " + (act.route || "模型") + " 把 " + act.lines.length + " 步工具调用翻译成大白话" }),
+          act && act.status === "loading" && jsx.jsx("div", { className: "tr-act-loading", children: "⏳ 正在把工具调用翻译成大白话…" }),
+          act && act.status === "error" && jsx.jsx("div", { className: "tr-act-err", children: "动作翻译失败：" + act.error }),
+          !act && r.actions.length > 0 && available === true && jsx.jsx("div", { className: "tr-act-manual", children:
+            jsx.jsx("button", { className: "tr-btn", onClick: props.onTranslate, children: "🧠 把动作翻译成大白话" })
+          }),
+          act && act.status === "error" && jsx.jsx("div", { className: "tr-act-manual", children:
+            jsx.jsx("button", { className: "tr-btn", onClick: props.onTranslate, children: "🧠 重新翻译动作" })
+          }),
+          !actDone && r.categories.map(function (c, i) {
             return jsx.jsx("div", { className: "tr-bullet", children: [
               jsx.jsx("span", { className: "tr-k", children: c.label + "（" + c.count + " 次）：" }),
               categoryLine(c)
@@ -721,9 +791,13 @@ window.__ModuleLoader__.load({
           var callId = root.callId || node.key || "";
           var when = typeof root.time === "number" ? root.time : (typeof d.time === "number" ? d.time : 0);
           if (root.kind === "tool-result") {
-            out.push({ kind: "tool-result", seq: seq, turn: turn, callId: callId, name: tname, isError: root.isError === true, call: { name: tname }, error: root.error, time: when });
+            out.push({
+              kind: "tool-result", seq: seq, turn: turn, callId: callId, name: tname,
+              isError: root.isError === true, call: { name: tname }, error: root.error,
+              content: root.content || d.content, time: when
+            });
           } else if (tname) {
-            out.push({ kind: "assistant", seq: seq, turn: turn, blocks: [{ kind: "tool-call", name: tname, argsRaw: argsRaw }], time: when });
+            out.push({ kind: "assistant", seq: seq, turn: turn, blocks: [{ kind: "tool-call", name: tname, argsRaw: argsRaw, callId: callId }], time: when });
             // 供「进行中进度」使用：未完成的工具调用（有 start 无 result 即进行中）
             out.push({ kind: "tool-start", seq: seq, turn: turn, callId: callId, name: tname, argsRaw: argsRaw, time: when });
           }
@@ -1007,6 +1081,18 @@ window.__ModuleLoader__.load({
         ] }),
 
         jsx.jsx("div", { className: "tr-field", children: [
+          jsx.jsx("span", { className: "tr-field-label", children: "工具调用的大白话翻译" }),
+          jsx.jsx("label", { className: "tr-radio", children: [
+            jsx.jsx("input", {
+              type: "checkbox",
+              checked: d.autoExplainActions,
+              onChange: function (e) { setD(function (p) { return Object.assign({}, p, { autoExplainActions: e.target.checked }); }); }
+            }),
+            "开启（每轮自动把「为了…，调用了…，结果…」翻出来，失败时可手动重试）"
+          ] })
+        ] }),
+
+        jsx.jsx("div", { className: "tr-field", children: [
           jsx.jsx("span", { className: "tr-field-label", children: "触发条件与阈值" }),
           jsx.jsx("div", { className: "tr-row", children: ["超过", numInput(d.triggers.idleTextMinutes, function (v) { patchTriggers({ idleTextMinutes: v }); }), "分钟没有面向用户的文字输出"] }),
           jsx.jsx("div", { className: "tr-row", style: { marginTop: 6 }, children: ["连续工具调用超过", numInput(d.triggers.toolBurstCount, function (v) { patchTriggers({ toolBurstCount: v }); }), "次"] }),
@@ -1204,6 +1290,72 @@ window.__ModuleLoader__.load({
         return rounds.map(function (r) { return materialKey(buildRoundMaterial(r)); });
       }, [rounds]);
 
+      // 动作大白话：缓存键 → { status, lines?, error?, route? }
+      var actState = React.useState({});
+      var actMap = actState[0];
+      var setActMap = actState[1];
+      var actBusy = React.useRef(false);
+
+      var actKeys = React.useMemo(function () {
+        return rounds.map(function (r) {
+          return r.actions && r.actions.length ? materialKey(buildActionsMaterial(r)) : "";
+        });
+      }, [rounds]);
+
+      /** 把一轮的工具调用交给模型翻成「为了…，调用了…，结果…」。 */
+      function translateActions(key, round) {
+        if (!key) return Promise.resolve();
+        setActMap(function (prev) { var n = Object.assign({}, prev); n[key] = { status: "loading" }; return n; });
+        return pickRoute()
+          .then(function (sel) {
+            var payload = { mode: "actions", rounds: [{ key: key, material: buildActionsMaterial(round) }] };
+            if (sel && typeof sel.provider === "string" && typeof sel.model === "string") {
+              payload.provider = sel.provider;
+              payload.model = sel.model;
+              if (typeof sel.reasoningEffort === "string" && sel.reasoningEffort) payload.reasoningEffort = sel.reasoningEffort;
+            }
+            if (props.sessionId) payload.sessionId = props.sessionId;
+            return postSummarize(payload);
+          })
+          .then(function (data) {
+            var res = (data.results || [])[0] || {};
+            var route = data.route || {};
+            setActMap(function (prev) {
+              var n = Object.assign({}, prev);
+              n[key] = res.ok
+                ? { status: "done", lines: parseActionLines(res.text), route: (route.provider || "?") + "/" + (route.model || "?") }
+                : { status: "error", error: res.error || "未知错误" };
+              return n;
+            });
+          })
+          .catch(function (err) {
+            setActMap(function (prev) {
+              var n = Object.assign({}, prev);
+              n[key] = { status: "error", error: (err && err.message) || String(err) };
+              return n;
+            });
+          });
+      }
+
+      // 自动翻译最近几轮的动作（一次一轮，结果缓存；失败不自动重试，交给按钮）。
+      React.useEffect(function () {
+        if (!settings.autoExplainActions || available === false || actBusy.current) return;
+        var todo = [];
+        for (var i = rounds.length - 1; i >= 0 && todo.length < 6; i--) {
+          var k = actKeys[i];
+          if (!k) continue;
+          var st = actMap[k];
+          if (st) continue; // loading / done / error 都不自动重跑，交给手动按钮
+          todo.push({ key: k, round: rounds[i] });
+        }
+        if (todo.length === 0) return;
+        actBusy.current = true;
+        translateActions(todo[0].key, todo[0].round).then(
+          function () { actBusy.current = false; },
+          function () { actBusy.current = false; }
+        );
+      }, [actKeys, actMap, settings.autoExplainActions, available]);
+
       function applyResults(route, results) {
         setAiMap(function (prev) {
           var next = Object.assign({}, prev);
@@ -1341,8 +1493,13 @@ window.__ModuleLoader__.load({
               return jsx.jsx(RoundCard, {
                 round: r,
                 ai: aiMap[keys[i]],
+                act: actMap[actKeys[i]],
                 available: available,
-                onSummarize: function () { summarizeOne(i); }
+                onSummarize: function () { summarizeOne(i); },
+                onTranslate: function () {
+                  setActMap(function (prev) { var n = Object.assign({}, prev); delete n[actKeys[i]]; return n; });
+                  translateActions(actKeys[i], r);
+                }
               }, "round-" + r.index);
             }),
         jsx.jsx("div", { className: "tr-foot", children: "轨迹解读 · 规则总结即时生成；✨ AI 过程解读由 LLM 按轮生成，展示助手的思考与执行全过程" }),
@@ -1426,6 +1583,8 @@ window.__ModuleLoader__.load({
     exports.mergeSettings = mergeSettings; // 供无头测试使用
     exports.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
     exports.buildRoundMaterial = buildRoundMaterial; // 供无头测试使用
+    exports.buildActionsMaterial = buildActionsMaterial; // 供无头测试使用
+    exports.parseActionLines = parseActionLines; // 供无头测试使用
     exports.materialKey = materialKey; // 供无头测试使用
     exports.SUMMARIZE_URL = SUMMARIZE_URL;
     return module.exports;

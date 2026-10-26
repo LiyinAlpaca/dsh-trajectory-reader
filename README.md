@@ -129,3 +129,17 @@ cd "$DSH_HOME/profiles/web" && pnpm remove @clarkchan/trajectory-reader
 - **⏱ Auto progress digest**: while the page is open, the current turn is evaluated every 5 s. If any condition holds — no user-facing text for N minutes (default 5), more than N consecutive tool calls (default 10), or a single tool call running longer than N minutes (default 3), each with its own cooldown (default 5) — one model call is made and the digest (`### 当前在做什么 / ### 进度 / ### 关键决策 / ### 需要注意`) is appended to the "进行中 · 自动进度解读" block at the top of the page.
 - Limitation: digests are produced only while the 轨迹解读 page is open (no node stream when the tab is hidden).
 - Routes: `GET/POST /plugin-api/trajectory-reader/settings`, `GET /plugin-api/trajectory-reader/models`, `POST /plugin-api/trajectory-reader/summarize` with `mode: "progress"`.
+
+## Fork additions (0.5.0): tool calls explained in plain language
+
+The "🛠 助手如何完成" block no longer dumps raw commands. Each round is automatically translated by the model into one line per call — *goal → tool → outcome*:
+
+```
+1. 为了查清仓库能不能装，调用了命令行工具，拿到 npm 包名与 0.2.5 版本号。
+2. 为了确认包里的插件声明，读取了 package.json，看到 web 端 client 注入点。
+```
+
+- Toggled by `settings.autoExplainActions` (settings panel → "工具调用的大白话翻译", on by default). When the page opens, the last 6 rounds are backfilled one at a time and cached by content hash.
+- On failure the card shows the error plus a "🧠 重新翻译动作" button; with the toggle off, each card keeps a manual "🧠 把动作翻译成大白话" button.
+- Raw commands/arguments stay available behind the expand toggle; if the model is unavailable the card falls back to the original rule-based summary instead of going blank.
+- Server side: `POST /plugin-api/trajectory-reader/summarize` accepts `mode: "actions"`; `ACTIONS_PROMPT` asks for `index. 为了…，调用了…，结果…` and forbids copying commands, JSON arguments or long paths.

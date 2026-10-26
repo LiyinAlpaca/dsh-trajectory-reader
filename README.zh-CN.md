@@ -148,3 +148,18 @@ cd "$DSH_HOME/profiles/web" && pnpm remove @clarkchan/trajectory-reader
 - 限制：自动解读只在「轨迹解读」页打开时进行——页面切走或窗口最小化时拿不到节点流。
 
 服务端路由：`GET/POST /plugin-api/trajectory-reader/settings`（读写设置）、`GET /plugin-api/trajectory-reader/models`（列本机 Ollama 模型）、`POST /plugin-api/trajectory-reader/summarize`（`mode: "progress"` 走进度提示词）。
+
+## 本 fork 新增（0.5.0）：把工具调用翻成大白话
+
+「🛠 助手如何完成」不再堆原始命令，而是每轮自动交给模型翻成一句话：
+
+```
+1. 为了查清仓库能不能装，调用了命令行工具，拿到 npm 包名与 0.2.5 版本号。
+2. 为了确认包里的插件声明，读取了 package.json，看到 web 端 client 注入点。
+```
+
+- 由设置页「工具调用的大白话翻译」控制（`settings.autoExplainActions`，默认开启）；页面打开时自动补翻最近 6 轮，一次一轮，结果按内容哈希缓存。
+- 失败时卡片里显示错误并给出「🧠 重新翻译动作」按钮；关掉开关后每张卡片保留「🧠 把动作翻译成大白话」手动按钮。
+- 原始命令与参数仍保留（展开可见），只是不再占据主要版面；模型不可用时自动退回原来的规则摘要，不会出现空白卡片。
+
+服务端 `POST /plugin-api/trajectory-reader/summarize` 新增 `mode: "actions"`，对应的 `ACTIONS_PROMPT` 要求逐条输出「序号. 为了…，调用了…，结果…」，并明确禁止照抄命令、JSON 参数与长路径。
