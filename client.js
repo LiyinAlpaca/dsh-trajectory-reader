@@ -21,6 +21,18 @@ window.__ModuleLoader__.load({
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
+    /**
+     * 本地模型路由（可选）。
+     *
+     * 置为 { provider, model } 时，「轨迹解读」的 AI 解读固定走该模型（例如本机 Ollama 的
+     * ollama-local / qwen35-4b-fast:latest），不消耗会话当前选中的云端模型额度；
+     * 置为 null 时恢复默认行为：跟随对话界面选中的模型。
+     *
+     * provider 为 "ollama-local" 时，服务端会走 Ollama 原生 /api/chat 并关闭思考链
+     * （OpenAI 兼容的 /v1 关不掉 thinking，正文会为空）。服务地址可用环境变量
+     * TRAJECTORY_READER_OLLAMA_URL 覆盖，默认 http://127.0.0.1:11434。
+     */
+    var LOCAL_ROUTE = { provider: "ollama-local", model: "qwen35-4b-fast:latest" };
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
     var React = require("react");
@@ -402,7 +414,7 @@ window.__ModuleLoader__.load({
     var SUMMARIZE_URL = "/plugin-api/trajectory-reader/summarize";
 
     // 模型来源标签（服务端 route.source）：「session」= 对话界面选中的模型；「default」= 会话默认模型；「fallback」= 兜底模型
-    var ROUTE_SOURCE_LABEL = { session: "会话模型", default: "默认模型", fallback: "兜底模型" };
+    var ROUTE_SOURCE_LABEL = { local: "本地模型", session: "会话模型", default: "默认模型", fallback: "兜底模型" };
 
     function cap(s, n) {
       s = String(s == null ? "" : s);
@@ -557,12 +569,89 @@ window.__ModuleLoader__.load({
       ] });
     }
 
+    /**
+     * 宿主兼容层：把 Chat 视图快照（{ order, nodes: store }）适配成 interpret() 认识的
+     * ConversationNode 形状（user / steering / assistant / tool-result / turn-error /
+     * turn-max-tokens / compaction / model-retry / command / context）。
+     *
+     * 为什么需要：会话快照（SessionSnapshot）的字段随宿主版本变化——旧版快照带 nodes，
+     * DSH 2.0.x 不再带；轮次节点统一落在 Chat 视图快照里，所以这里从视图快照读取。
+     */
+    function adaptChatNodes(view) {
+      var out = [];
+      if (!view || !view.nodes || !Array.isArray(view.order)) return out;
+      var store = view.nodes;
+      function nodeAt(key) {
+        try { return typeof store.get === "function" ? store.get(key) : null; } catch (e) { return null; }
+      }
+      function turnOf(node) {
+        var loc = node && node.location;
+        if (loc && loc.turn && typeof loc.turn.turn === "number") return loc.turn.turn;
+        if (node && node.data && typeof node.data.turn === "number") return node.data.turn;
+        return null;
+      }
+      function seqOf(node) {
+        if (node && typeof node.anchorSeq === "number") return node.anchorSeq;
+        if (node && node.data && typeof node.data.seq === "number") return node.data.seq;
+        return 0;
+      }
+      for (var i = 0; i < view.order.length; i++) {
+        var node = nodeAt(view.order[i]);
+        if (!node) continue;
+        if (node.visibility && node.visibility !== "visible") continue;
+        var d = node.data || {};
+        var seq = seqOf(node);
+        var turn = turnOf(node);
+        if (node.kind === "user" || node.kind === "steering") {
+          out.push({ kind: node.kind, seq: seq, turn: turn, content: d.content });
+        } else if (node.kind === "assistant-step") {
+          out.push({ kind: "assistant", seq: seq, turn: typeof d.turn === "number" ? d.turn : turn, blocks: d.blocks || [] });
+        } else if (node.kind === "tool-call") {
+          var root = d.root || d;
+          var tname = root.name || (root.call && root.call.name) || "";
+          var argsRaw = root.argsRaw || (root.call && root.call.argsRaw) || "";
+          if (root.kind === "tool-result") {
+            out.push({ kind: "tool-result", seq: seq, turn: turn, isError: root.isError === true, call: { name: tname }, error: root.error });
+          } else if (tname) {
+            out.push({ kind: "assistant", seq: seq, turn: turn, blocks: [{ kind: "tool-call", name: tname, argsRaw: argsRaw }] });
+          }
+        } else if (node.kind === "turn-error") {
+          out.push({ kind: "turn-error", seq: seq, turn: turn, message: d.message || "回合错误" });
+        } else if (node.kind === "turn-max-tokens") {
+          out.push({ kind: "turn-max-tokens", seq: seq, turn: turn });
+        } else if (node.kind === "compaction") {
+          out.push({ kind: "compaction", seq: seq, turn: turn });
+        } else if (node.kind === "model-retry") {
+          out.push({ kind: "model-retry", seq: seq, turn: turn });
+        } else if (node.kind === "command") {
+          out.push({ kind: "command", seq: seq, turn: turn, name: d.name || "命令", args: d.args || "", outcome: d.outcome });
+        } else if (node.kind === "context") {
+          out.push({ kind: "context", seq: seq, turn: turn, content: d.content });
+        }
+      }
+      return out;
+    }
+    exports.adaptChatNodes = adaptChatNodes; // 供无头测试使用
+
     function TrajectoryReaderView(props) {
-      var useSession = props.useSession;
-      var nodes = [];
-      try {
-        if (typeof useSession === "function") nodes = useSession(function (snap) { return (snap && snap.nodes) || []; }) || [];
-      } catch (e) { /* snapshot not ready */ }
+      // 节点来源：Chat 视图快照；拿不到时退回 useChat 的同一份快照。
+      var useConversation = props.useConversation;
+      var chatView = typeof useConversation === "function"
+        ? useConversation(function (snap) {
+            try {
+              if (!snap || !snap.views || typeof snap.views.get !== "function") return null;
+              return snap.views.get("chat") || null;
+            } catch (e) { return null; }
+          })
+        : null;
+      var useChat = props.useChat;
+      var chatStore = typeof useChat === "function"
+        ? useChat(function (snap) { return snap && Array.isArray(snap.order) && snap.order.length ? snap : null; })
+        : null;
+      var nodes = React.useMemo(function () {
+        var view = chatView && Array.isArray(chatView.order) && chatView.order.length ? chatView : chatStore;
+        return adaptChatNodes(view);
+      }, [chatView, chatStore]);
       var interp = React.useMemo(function () { return interpret(nodes); }, [nodes]);
       var stats = interp.stats;
       var rounds = interp.rounds;
@@ -622,14 +711,16 @@ window.__ModuleLoader__.load({
             var payload = { rounds: pending.slice(0, 12).map(function (p) {
               return { key: p.key, material: buildRoundMaterial(p.round) };
             }) };
-            // 使用对话界面当前选择的模型（无则让服务端回退到默认）
-            var sel = null;
-            if (props.fetchSelectedModel) {
-              sel = await props.fetchSelectedModel();
-            } else if (props.getSelectedModel) {
-              sel = props.getSelectedModel();
-            } else {
-              console.error("[trajectory-reader] 槽位 inject 未生效：props 中缺少 fetchSelectedModel/getSelectedModel（session=" + String(props.sessionId || "?") + "）");
+            // 模型来源：LOCAL_ROUTE 非空 → 固定该模型；为空 → 跟随对话界面当前选择的模型
+            var sel = LOCAL_ROUTE ? Object.assign({}, LOCAL_ROUTE) : null;
+            if (!sel) {
+              if (props.fetchSelectedModel) {
+                sel = await props.fetchSelectedModel();
+              } else if (props.getSelectedModel) {
+                sel = props.getSelectedModel();
+              } else {
+                console.error("[trajectory-reader] 槽位 inject 未生效：props 中缺少 fetchSelectedModel/getSelectedModel（session=" + String(props.sessionId || "?") + "）");
+              }
             }
             if (sel && typeof sel.provider === "string" && typeof sel.model === "string") {
               payload.provider = sel.provider;

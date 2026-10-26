@@ -20,6 +20,11 @@ const MAX_ROUNDS_PER_REQUEST = 12;
 /** Per-round model-call budget (room for reasoning + the 400-char answer). */
 const MAX_OUTPUT_TOKENS = 4000;
 const CALL_TIMEOUT_MS = 120000;
+/** 本地 Ollama 直连参数（必须走原生 /api/chat 才能关掉思考链）。 */
+const LOCAL_PROVIDER = "ollama-local";
+const LOCAL_BASE_URL = process.env.TRAJECTORY_READER_OLLAMA_URL || "http://127.0.0.1:11434";
+const LOCAL_NUM_PREDICT = 900;
+const LOCAL_TIMEOUT_MS = 300000;
 /** Server-side re-cap of every string we forward to the model. */
 const MAX_TEXT_CHARS = 4000;
 
@@ -125,7 +130,7 @@ function frameRound(material, index) {
 /** Resolve the model route: explicit override → live default selection → fallback. */
 function resolveRoute(ctx, body) {
   if (typeof body.provider === "string" && body.provider && typeof body.model === "string" && body.model) {
-    return { provider: body.provider, model: body.model, source: "session" };
+    return { provider: body.provider, model: body.model, source: body.provider === LOCAL_PROVIDER ? "local" : "session" };
   }
   const def = ctx.get("agentDefaultModel");
   if (def && typeof def.currentSelection === "function") {
@@ -148,9 +153,55 @@ function logSummarize(sessionId, route, roundCount) {
   } catch { /* diagnostics must never break the route */ }
 }
 
-/** One round → one model call → { key, ok, text? , error? }. */
+/**
+ * 本地 Ollama 路由：原生 /api/chat + think:false。
+ *
+ * 带思考链的模型（qwen3.5 / qwen35 等）在 OpenAI 兼容的 /v1 上无法关闭 thinking，
+ * token 预算会被 reasoning 吃光、正文为空；只有原生接口能稳定拿到正文。
+ */
+async function summarizeWithLocalOllama(route, material, index, outerSignal) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), LOCAL_TIMEOUT_MS);
+  const onAbort = () => ac.abort();
+  if (outerSignal) {
+    if (outerSignal.aborted) ac.abort();
+    else outerSignal.addEventListener("abort", onAbort, { once: true });
+  }
+  try {
+    const res = await fetch(LOCAL_BASE_URL + "/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: route.model,
+        stream: false,
+        think: false,
+        options: { num_predict: LOCAL_NUM_PREDICT, temperature: 0.2 },
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: frameRound(material, index) },
+        ],
+      }),
+      signal: ac.signal,
+    });
+    if (!res.ok) throw new Error("ollama HTTP " + res.status + "（本地 Ollama 未启动？）");
+    const json = await res.json();
+    const text = (json && json.message && json.message.content ? json.message.content : "").trim();
+    if (!text) throw new Error("ollama 返回空正文（done_reason=" + (json && json.done_reason || "?") + "）");
+    return text;
+  } finally {
+    clearTimeout(timer);
+    if (outerSignal) outerSignal.removeEventListener("abort", onAbort);
+  }
+}
+
+/** One round → one model call → { key, ok, text?, error? }. */
 async function summarizeRound(ctx, route, key, material, index, signal, reasoningEffort) {
   try {
+    // 本地 Ollama：直接走原生接口，不经过宿主的 llm 服务。
+    if (route.provider === LOCAL_PROVIDER) {
+      const text = await summarizeWithLocalOllama(route, material, index, signal);
+      return { key, ok: true, text };
+    }
     const options = {
       provider: route.provider,
       model: route.model,

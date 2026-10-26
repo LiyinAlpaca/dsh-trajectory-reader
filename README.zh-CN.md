@@ -29,6 +29,27 @@ dsh plugin --profile web add "github:flyingtimes/dsh-trajectory-reader#v0.2.3"
 
 > 本包声明了 `dsh.bundle.patch`，`dsh plugin add` 安装后会**自动加入 `dsh.profile.bundles` 激活**，无需手动改 `cordis.patch.yml`。之后重启 `dsh web` 即可在会话标签栏看到「对话 / 轨迹 / **轨迹解读**」。
 
+## 本 fork 的改动（DSH 2.0.x 适配 + 本地模型）
+
+这个 fork（`0.3.0`）在上游基础上改了两处：
+
+1. **修复 DSH 2.0.x 上永远显示「暂无轨迹数据」**：上游从会话快照的 `nodes` 字段取数据，而 DSH 2.0.x 的 `SessionSnapshot` 已不再带该字段（只剩 sessionId/running/hasMore 等），于是轮次恒为 0、AI 解读按钮不出现。这里改为从 Chat 视图快照取节点（`useConversation((s) => s.views.get("chat"))`，取不到时退回 `useChat` 的同一份快照），再适配成 `interpret()` 认识的形状；旧宿主行为不变。
+2. **本地 Ollama 解读（可选，默认开启）**：`client.js` 顶部的 `LOCAL_ROUTE` 置为 `{ provider: "ollama-local", model: "..." }` 时，AI 解读固定走本机 Ollama；置为 `null` 即恢复「跟随对话界面所选模型」。provider 为 `ollama-local` 时服务端走**原生 `/api/chat` + `think:false`**——带思考链的 qwen3.5/qwen35 在 OpenAI 兼容 `/v1` 上关不掉 thinking，预算会被 reasoning 吃光、正文为空。地址可用环境变量 `TRAJECTORY_READER_OLLAMA_URL` 覆盖（默认 `http://127.0.0.1:11434`）。
+
+安装这个 fork（`main` 分支即 `0.3.0`）：
+
+```sh
+# 命令行/Web 版
+dsh plugin add github:LiyinAlpaca/dsh-trajectory-reader
+
+# 桌面版（DSH NEXT）：走 App 自带的 profile 管理入口
+cd "C:/Users/Administrator/AppData/Local/Programs/DSH NEXT"
+DSH_HOME="C:\\Users\\Administrator\\.dsh" ELECTRON_RUN_AS_NODE=1 ./"DSH NEXT.exe" --expose-internals \
+  "resources/app.asar/lib/plugin-cli.js" desktop add github:LiyinAlpaca/dsh-trajectory-reader
+```
+
+装完需要重启一次 GUI。
+
 ## 相关链接
 
 - npm 包：https://www.npmjs.com/package/@clarkchan/trajectory-reader

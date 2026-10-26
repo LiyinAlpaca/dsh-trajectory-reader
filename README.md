@@ -29,6 +29,27 @@ dsh plugin --profile web add "github:flyingtimes/dsh-trajectory-reader#v0.2.3"
 
 > The package declares `dsh.bundle.patch`, so `dsh plugin add` **automatically appends it to `dsh.profile.bundles`** — no manual `cordis.patch.yml` editing. After that, restart `dsh web` and the conversation tab bar shows 对话 / 轨迹 / **轨迹解读**.
 
+## Changes in this fork (DSH 2.0.x compatibility + local model)
+
+Two changes on top of upstream, released as `0.3.0`:
+
+1. **Fixes the permanent “暂无轨迹数据” (no trajectory data) on DSH 2.0.x.** Upstream reads the conversation snapshot's `nodes` field; DSH 2.0.x `SessionSnapshot` no longer carries it (only sessionId/running/hasMore/…), so rounds were always 0 and the AI button never rendered. This fork reads nodes from the Chat view snapshot instead (`useConversation((s) => s.views.get("chat"))`, falling back to the same snapshot via `useChat`) and adapts them to the shape `interpret()` expects. Older hosts keep working.
+2. **Optional local Ollama summarizer (on by default).** When `LOCAL_ROUTE` at the top of `client.js` is `{ provider: "ollama-local", model: "..." }`, the AI narrative is pinned to your local Ollama; set it to `null` to restore “follow the model selected in the conversation”. For `ollama-local` the server calls **native `/api/chat` with `think:false`** — thinking models (qwen3.5 / qwen35) cannot disable reasoning through the OpenAI-compatible `/v1` endpoint, so the budget is eaten by reasoning and the content comes back empty. Override the address with `TRAJECTORY_READER_OLLAMA_URL` (default `http://127.0.0.1:11434`).
+
+Install this fork (`main` is `0.3.0`):
+
+```sh
+# CLI / web profile
+dsh plugin add github:LiyinAlpaca/dsh-trajectory-reader
+
+# Desktop (DSH NEXT) — use the app's own profile manager
+cd "C:/Users/Administrator/AppData/Local/Programs/DSH NEXT"
+DSH_HOME="C:\\Users\\Administrator\\.dsh" ELECTRON_RUN_AS_NODE=1 ./"DSH NEXT.exe" --expose-internals \
+  "resources/app.asar/lib/plugin-cli.js" desktop add github:LiyinAlpaca/dsh-trajectory-reader
+```
+
+Restart the GUI once after installing.
+
 ## Links
 
 - npm package: https://www.npmjs.com/package/@clarkchan/trajectory-reader
